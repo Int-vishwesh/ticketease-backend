@@ -1,0 +1,24 @@
+{
+	"name": "Python FastAPI Dev Container",
+	"build": {
+		"dockerfile": "../Dockerfile",
+		"context": ".."
+	},
+	"customizations": {
+		"vscode": {
+			"settings": {
+				"python.defaultInterpreterPath": "/usr/local/bin/python",
+				"python.linting.enabled": true,
+				"python.linting.pylintEnabled": true
+			},
+			"extensions": [
+				"ms-python.python"
+			]
+		}
+	},
+	"forwardPorts": [
+		8000
+	],
+	"postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
+	"remoteUser": "root"
+} 

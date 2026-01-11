@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from typing import List, Dict, Optional
 import uuid
 from datetime import datetime, timedelta
+import db  # Import the new database module
 
 # Load environment variables
 load_dotenv()
@@ -95,6 +96,9 @@ def clean_expired_sessions():
     expired_sessions = [sid for sid, session in active_sessions.items() if session.is_expired()]
     for sid in expired_sessions:
         del active_sessions[sid]
+@app.get("/")
+def hlo():
+    return {"status":"backend running"}
 
 @app.post("/chat")
 async def chat(request: UserInput):
@@ -163,11 +167,38 @@ async def chat(request: UserInput):
     # Return streaming response using the generator
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
+# --- New Endpoints for Authentication & Data ---
+
+@app.post("/signup")
+async def signup(user: db.UserCreate):
+    """Endpoint to register a new user"""
+    try:
+        response = db.sign_up_user(user)
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/login")
+async def login(user: db.UserLogin):
+    """Endpoint to login a user"""
+    try:
+        response = db.sign_in_user(user)
+        return response
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/bookings/{user_id}")
+async def get_bookings(user_id: str):
+    """Endpoint to get user bookings"""
+    return db.get_user_bookings(user_id)
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
 
+
+#-------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

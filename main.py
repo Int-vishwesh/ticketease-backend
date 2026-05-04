@@ -1,3 +1,4 @@
+print("Loading main.py clean version...")
 from fastapi import FastAPI, Response, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -8,7 +9,7 @@ import json
 import asyncio
 import sys
 from dotenv import load_dotenv
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import uuid
 from datetime import datetime, timedelta
 import db  # Import the new database module
@@ -65,46 +66,79 @@ Always be friendly, helpful, and concise in your responses.
 active_sessions = {}
 
 # Session expiry time (30 minutes)
+# Session expiry time (30 minutes)
 SESSION_EXPIRY = timedelta(minutes=30)
+
+class Session:
+    def __init__(self):
+        self.messages = []
+        self.last_activity = datetime.now()
+
+    def add_message(self, role, content):
+        self.last_activity = datetime.now()
+        # Ensure we don't duplicate tool calls or results if they are already handled logic is complex, 
+        # but for now just appending is standard.
+        # Note: 'content' can be None for assistant messages with tool calls
+        if content or role == "tool" or (role == "assistant" and content is None):
+             self.messages.append({"role": role, "content": content})
+
+    def get_messages(self):
+        self.last_activity = datetime.now()
+        return [{"role": "system", "content": SYSTEM_PROMPT}] + self.messages
+
+def clean_expired_sessions():
+    """Remove sessions that have been inactive for longer than SESSION_EXPIRY"""
+    now = datetime.now()
+    expired_sessions = [
+        sid for sid, session in active_sessions.items() 
+        if now - session.last_activity > SESSION_EXPIRY
+    ]
+    for sid in expired_sessions:
+        del active_sessions[sid]
 
 # Pydantic model for the user's input
 class UserInput(BaseModel):
     query: str
     session_id: Optional[str] = None
+    user_id: Optional[str] = None
 
-class Message(BaseModel):
-    role: str
-    content: str
-
-class Session:
-    def __init__(self):
-        self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        self.last_active = datetime.now()
-    
-    def add_message(self, role: str, content: str):
-        self.messages.append({"role": role, "content": content})
-        self.last_active = datetime.now()
-    
-    def is_expired(self):
-        return (datetime.now() - self.last_active) > SESSION_EXPIRY
-    
-    def get_messages(self):
-        return self.messages
-
-# Function to clean up expired sessions
-def clean_expired_sessions():
-    expired_sessions = [sid for sid, session in active_sessions.items() if session.is_expired()]
-    for sid in expired_sessions:
-        del active_sessions[sid]
+# Tool definition for Groq
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "save_booking",
+            "description": "Save a confirmed booking to the database. Call this ONLY after the user has explicitly confirmed the booking details.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "booking_type": {
+                        "type": "string",
+                        "description": "The type of booking (e.g., 'movie', 'concert', 'doctor', 'amusement_park', 'sports')",
+                    },
+                    "details": {
+                        "type": "object",
+                        "description": "A dictionary containing all booking details (e.g., artist, venue, time, seats, doctor name, etc.)",
+                    },
+                    "confirmation_id": {
+                        "type": "string",
+                        "description": "The generated confirmation ID (e.g., BOOK-XXXX-XXXX)",
+                    }
+                },
+                "required": ["booking_type", "details", "confirmation_id"],
+            },
+        },
+    }
+]
 @app.get("/")
-def hlo():
-    return {"status":"backend running"}
+async def root():
+    return {"message": "TicketEase Backend running!"}
 
 @app.post("/chat")
 async def chat(request: UserInput):
     """
     Endpoint to handle a single user query string and stream responses.
-    Takes a JSON body like: {"query": "Your message here", "session_id": "optional-session-id"}
+    Takes a JSON body like: {"query": "Your message here", "session_id": "optional-session-id", "user_id": "optional-user-id"}
     Returns a streaming response with the AI's reply and a session ID.
     """
     # Clean expired sessions first
@@ -126,41 +160,125 @@ async def chat(request: UserInput):
             # Get all messages from the session
             messages = session.get_messages()
 
-            # Stream the response preparation
             yield f"data: {json.dumps({'type': 'session', 'session_id': session_id})}\n\n"
             
-            # Call Groq API
-            completion = groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-                temperature=0.7,
-                max_tokens=1024,
-                top_p=1,
-                stream=True,
-            )
+            # Prepare args for Groq
+            api_args = {
+                "model": "llama-3.3-70b-versatile",
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 1024,
+                "top_p": 1,
+                "stream": True,
+            }
 
-            # Collect the full response
-            full_response = ""
+            # Only add tools if user_id is present (we need user_id to save)
+            if request.user_id:
+                api_args["tools"] = tools
+                api_args["tool_choice"] = "auto"
             
-            # Stream the response
+            # Call Groq API
+            completion = groq_client.chat.completions.create(**api_args)
+
+            full_response = ""
+            tool_calls = []
+            current_tool_call = None
+
             for chunk in completion:
-                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
+                delta = chunk.choices[0].delta if chunk.choices else None
+                
+                # Check for tool_calls
+                if delta and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        if tc.id: # New tool call
+                            if current_tool_call:
+                                tool_calls.append(current_tool_call)
+                            current_tool_call = {
+                                "id": tc.id,
+                                "function": {
+                                    "name": tc.function.name,
+                                    "arguments": tc.function.arguments or ""
+                                },
+                                "type": tc.type
+                            }
+                        elif current_tool_call: # Append arguments
+                            current_tool_call["function"]["arguments"] += (tc.function.arguments or "")
+
+                # Check for content
+                if delta and delta.content:
+                    content = delta.content
                     full_response += content
-                    # Format as SSE
                     yield f"data: {json.dumps({'type': 'text', 'value': content})}\n\n"
-                    # Small delay to prevent overwhelming the client
                     await asyncio.sleep(0.01)
             
-            # Add the assistant's response to the session
-            session.add_message("assistant", full_response)
+            # Handle any completed tool calls
+            if current_tool_call:
+                tool_calls.append(current_tool_call)
+
+            if tool_calls:
+                # Add the assistant's message with tool calls to history
+                session.messages.append({
+                    "role": "assistant",
+                    "tool_calls": tool_calls,
+                    "content": full_response or None # Content might be empty if only tool called
+                })
+
+                # Execute tools
+                for tc in tool_calls:
+                    func_name = tc["function"]["name"]
+                    args_str = tc["function"]["arguments"]
+                    
+                    if func_name == "save_booking":
+                        try:
+                            args = json.loads(args_str)
+                            # Call the db function
+                            db.save_booking(
+                                user_id=request.user_id,
+                                booking_type=args.get("booking_type"),
+                                details=args.get("details"),
+                                confirmation_id=args.get("confirmation_id")
+                            )
+                            tool_result = json.dumps({"status": "success", "message": "Booking saved to database."})
+                        except Exception as e:
+                            print(f"Error saving booking: {e}")
+                            tool_result = json.dumps({"status": "error", "message": str(e)})
+                        
+                        # Add tool result to messages
+                        session.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": tool_result
+                        })
+
+                # Call LLM again to generate final response (confirmation to user)
+                completion_final = groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=session.get_messages(),
+                    stream=True
+                )
+                
+                # Reset full_response for the final message
+                full_response = ""
+
+                # Stream the final response
+                for chunk in completion_final:
+                    if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        full_response += content
+                        yield f"data: {json.dumps({'type': 'text', 'value': content})}\n\n"
+                        await asyncio.sleep(0.01)
+
+                # Add the final text response to history
+                session.add_message("assistant", full_response)
+                
+            else:
+                # No tools called, just save the response
+                session.add_message("assistant", full_response)
             
-            # End of stream marker
             yield f"data: [DONE]\n\n"
 
         except Exception as e:
             error_message = f"Error generating response: {str(e)}"
-            # Send error message via SSE
             yield f"data: {json.dumps({'type': 'error', 'value': error_message})}\n\n"
             yield f"data: [DONE]\n\n"
 
@@ -196,6 +314,26 @@ async def get_bookings(user_id: str):
 async def health_check():
     """Health check endpoint"""
     return {"status": "healthy"}
+
+class BookingCreate(BaseModel):
+    user_id: str
+    booking_type: str
+    details: Dict[str, Any]
+    confirmation_id: str
+
+@app.post("/bookings")
+async def create_booking(booking: BookingCreate):
+    """Endpoint to create a new booking directly"""
+    try:
+        response = db.save_booking(
+            user_id=booking.user_id,
+            booking_type=booking.booking_type,
+            details=booking.details,
+            confirmation_id=booking.confirmation_id
+        )
+        return {"status": "success", "message": "Booking saved to database."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 #-------------------------
